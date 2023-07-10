@@ -9,7 +9,7 @@ set -e
 
 DEPRECATION_MESSAGE_PLACEHOLDER
 
-install_script_version=1.16.0.post
+install_script_version=1.18.0.post
 logfile="ddagent-install.log"
 support_email=support@datadoghq.com
 
@@ -20,13 +20,15 @@ LEGACY_CONF="$LEGACY_ETCDIR/datadog.conf"
 # repodata and newly released packages
 # DATADOG_APT_KEY_382E94DE.public expires in 2022
 # DATADOG_APT_KEY_F14F620E.public expires in 2032
-APT_GPG_KEYS=("DATADOG_APT_KEY_CURRENT.public" "DATADOG_APT_KEY_F14F620E.public" "DATADOG_APT_KEY_382E94DE.public")
+# DATADOG_APT_KEY_C0962C7D.public expires in 2028
+APT_GPG_KEYS=("DATADOG_APT_KEY_CURRENT.public" "DATADOG_APT_KEY_C0962C7D.public" "DATADOG_APT_KEY_F14F620E.public" "DATADOG_APT_KEY_382E94DE.public")
 
 # DATADOG_RPM_KEY_CURRENT.public always contains key used to sign current
 # repodata and newly released packages
 # DATADOG_RPM_KEY_E09422B3.public expires in 2022
 # DATADOG_RPM_KEY_FD4BF915.public expires in 2024
-RPM_GPG_KEYS=("DATADOG_RPM_KEY_CURRENT.public" "DATADOG_RPM_KEY_E09422B3.public" "DATADOG_RPM_KEY_FD4BF915.public")
+# DATADOG_RPM_KEY_B01082D3.public expires in 2028
+RPM_GPG_KEYS=("DATADOG_RPM_KEY_CURRENT.public" "DATADOG_RPM_KEY_B01082D3.public" "DATADOG_RPM_KEY_FD4BF915.public" "DATADOG_RPM_KEY_E09422B3.public")
 
 # DATADOG_RPM_KEY.public (4172A230) was only useful to install old (< 6.14) Agent packages.
 # We no longer add it and we explicitly remove it.
@@ -232,6 +234,31 @@ function remove_rpm_gpg_keys() {
     done
 }
 
+function create_config_file() {
+    local sudo_cmd="$1"
+    local config_file="$2"
+    local owner="$3"
+
+    if [ ! -e "$config_file" ]; then
+        $sudo_cmd cp "$config_file.example" "$config_file"
+    fi
+
+    $sudo_cmd chown "$owner:dd-agent" "$config_file"
+    $sudo_cmd chmod 640 "$config_file"
+}
+
+function ensure_config_file_exists() {
+    local sudo_cmd="$1"
+    local config_file="$2"
+    local owner="$3"
+
+    if [ -e "$config_file" ]; then
+        printf "\033[34m\n* Keeping old $config_file configuration file\n\033[0m\n"
+    else
+        create_config_file "$sudo_cmd" "$config_file" "$owner"
+    fi
+}
+
 echo -e "\033[34m\n* Datadog AgentINSTALL_SCRIPT_REPORT_VERSION_PLACEHOLDER install script v${install_script_version}\n\033[0m"
 
 hostname=
@@ -252,6 +279,11 @@ fi
 no_start=
 if [ -n "$DD_INSTALL_ONLY" ]; then
     no_start=true
+fi
+
+no_agent=
+if [ -n "$DD_NO_AGENT_INSTALL" ]; then
+    no_agent=true
 fi
 
 host_tags=
@@ -324,6 +356,87 @@ if [ -n "$DD_FIPS_MODE" ]; then
   fips_mode=$DD_FIPS_MODE
 fi
 
+declare -a apm_libraries
+declare host_injection_enabled
+declare docker_injection_enabled
+
+if [ "$DD_APM_INSTRUMENTATION_ENABLED" = "all" ] ; then
+  host_injection_enabled="true"
+  docker_injection_enabled="true"
+fi
+
+if [ "$DD_APM_INSTRUMENTATION_ENABLED" = "host" ] ; then
+  host_injection_enabled="true"
+fi
+
+if [ "$DD_APM_INSTRUMENTATION_ENABLED" = "docker" ] ; then
+  docker_injection_enabled="true"
+  no_agent=true
+fi
+
+if [ -n "${host_injection_enabled}${docker_injection_enabled}" ] ; then
+    apm_libraries=("datadog-apm-inject")
+fi
+
+if [ -n "${host_injection_enabled}" ] && [ -n "${no_agent}" ] ; then
+    ERROR_MESSAGE="Host injection is not supported with the DD_NO_AGENT_INSTALL flag. Unset either DD_APM_INSTRUMENTATION_ENABLED or DD_NO_AGENT_INSTALL"
+    ERROR_CODE=$INVALID_PARAMETERS_CODE
+    echo -e "\033[31m$ERROR_MESSAGE\033[0m\n"
+    report_telemetry
+    exit 1;
+fi
+
+daemon_config_dir="/etc/docker"
+
+if [ -n "$docker_injection_enabled" ]; then
+    if [ ! -d "$daemon_config_dir" ]; then
+      ERROR_MESSAGE="$daemon_config_dir does not exist. Please ensure docker is installed"
+      ERROR_CODE=$INVALID_PARAMETERS_CODE
+      echo -e "\033[31m$ERROR_MESSAGE\033[0m\n"
+      report_telemetry
+      exit 1;
+    fi
+fi
+
+if [ -n "$DD_APM_INSTRUMENTATION_LANGUAGES" ]; then
+  read -r -a lib_array <<< "$DD_APM_INSTRUMENTATION_LANGUAGES"
+  for lib in "${lib_array[@]}"
+  do
+    case $lib in
+      all)
+        apm_libraries+=("datadog-apm-library-all")
+        ;;
+      java)
+        apm_libraries+=("datadog-apm-library-java")
+        ;;
+      js)
+        apm_libraries+=("datadog-apm-library-js")
+        ;;
+      python)
+        apm_libraries+=("datadog-apm-library-python")
+        ;;
+      dotnet)
+        apm_libraries+=("datadog-apm-library-dotnet")
+        ;;
+      *)
+        ERROR_MESSAGE="Unknown apm library: $lib. Must be one of: all, java, js, python, dotnet"
+        ERROR_CODE=$INVALID_PARAMETERS_CODE
+        echo "$ERROR_MESSAGE"
+        report_telemetry
+        exit 1;
+        ;;
+    esac
+  done
+elif [ -n "$host_injection_enabled" ] || [ -n "$docker_injection_enabled" ]; then
+  # Default to all libraries if injection is enabled
+  apm_libraries+=("datadog-apm-library-all")
+fi
+
+no_config_change=
+if [ -n "$DD_APM_INSTRUMENTATION_NO_CONFIG_CHANGE" ]; then
+  no_config_change="--no-config-change"
+fi
+
 system_probe_ensure_config=
 if [ -n "$DD_SYSTEM_PROBE_ENSURE_CONFIG" ]; then
   system_probe_ensure_config=$DD_SYSTEM_PROBE_ENSURE_CONFIG
@@ -334,15 +447,36 @@ if [ -n "$DD_AGENT_FLAVOR" ]; then
     agent_flavor=$DD_AGENT_FLAVOR #Eg: datadog-iot-agent
 fi
 
-declare -A flavor_to_readable
-flavor_to_readable=(
-    ["datadog-agent"]="Datadog Agent"
-    ["datadog-iot-agent"]="Datadog IoT Agent"
-    ["datadog-dogstatsd"]="Datadog Dogstatsd"
-    ["datadog-fips-proxy"]="Datadog FIPS Proxy"
-    ["datadog-heroku-agent"]="Datadog Heroku Agent"
-)
-nice_flavor=${flavor_to_readable[$agent_flavor]}
+# Emulate hashmap with simple switch case
+getMapData() {
+
+    if [ "$1" = "flavor_to_readable" ]; then
+        case "$2" in
+            "datadog-agent")
+                DATA="Datadog Agent"
+                ;;
+             "datadog-iot-agent")
+                DATA="Datadog IoT Agent"
+                ;;
+             "datadog-dogstatsd")
+                DATA="Datadog Dogstatsd"
+                ;;
+             "datadog-fips-proxy")
+                DATA="Datadog FIPS Proxy"
+                ;;
+             "datadog-heroku-agent")
+                DATA="Datadog Heroku Agent"
+                ;;
+              *)
+                DATA="Unknown"
+                ;;
+         esac
+    fi
+    printf '%s' "$DATA"
+}
+
+nice_flavor=$(getMapData flavor_to_readable "$agent_flavor")
+
 
 if [ -z "$nice_flavor" ]; then
     ERROR_MESSAGE="Unknown DD_AGENT_FLAVOR \"$agent_flavor\""
@@ -353,32 +487,41 @@ if [ -z "$nice_flavor" ]; then
     exit 1;
 fi
 
-declare -A flavor_to_system_service
-flavor_to_system_service=(
-    ["datadog-dogstatsd"]="datadog-dogstatsd"
-)
-system_service=${flavor_to_system_service[$agent_flavor]:-datadog-agent}
+if [ "$agent_flavor" = "datadog-dogstatsd" ]; then
+    system_service="datadog-dogstatsd"
+    etcdir="/etc/datadog-dogstatsd"
+    config_file="$etcdir/dogstatsd.yaml"
+fi
+
+if [ -z "$system_service" ]; then
+    system_service="datadog-agent"
+fi
 
 declare -a services
-services=("$system_service")
+
+if [ "$no_agent" ]; then
+  services=()
+else
+  services=("$system_service")
+fi
+
 if [ -n "$fips_mode" ]; then
   services+=("datadog-fips-proxy")
 fi
 
-declare -A flavor_to_etcdir
-flavor_to_etcdir=(
-    ["datadog-dogstatsd"]="/etc/datadog-dogstatsd"
-)
-etcdir=${flavor_to_etcdir[$agent_flavor]:-/etc/datadog-agent}
+if [ -z "$etcdir" ]; then
+    etcdir="/etc/datadog-agent"
+fi
+
 etcdirfips=/etc/datadog-fips-proxy
 
-declare -A flavor_to_config
-flavor_to_config=(
-    ["datadog-dogstatsd"]="$etcdir/dogstatsd.yaml"
-)
-config_file=${flavor_to_config[$agent_flavor]:-$etcdir/datadog.yaml}
+if [ -z "$config_file" ]; then
+    config_file="$etcdir/datadog.yaml"
+fi
+
 config_file_fips=$etcdirfips/datadog-fips-proxy.cfg
 system_probe_config_file=$etcdir/system-probe.yaml
+security_agent_config_file=$etcdir/security-agent.yaml
 
 agent_major_version=AGENT_MAJOR_VERSION_PLACEHOLDER
 # shellcheck disable=SC2050
@@ -448,18 +591,26 @@ fi
 
 if [ ! "$apikey" ]; then
   # if it's an upgrade, then we will use the transition script
-  if [ ! "$upgrade" ] && [ ! -e "$config_file" ]; then
+  if [ ! "$upgrade" ] && [ ! -e "$config_file" ] && [ ! "$no_agent" ]; then
     printf "\033[31mAPI key not available in DD_API_KEY environment variable.\033[0m\n"
     exit 1;
   fi
 fi
 
-if [[ `uname -m` == "armv7l" ]] && [[ $agent_flavor == "datadog-agent" ]]; then
-    ERROR_MESSAGE="The full $nice_flavor isn't available for your architecture (armv7l).\nInstall the ${flavor_to_readable[datadog-iot-agent]} by setting DD_AGENT_FLAVOR='datadog-iot-agent'."
+if [[ `uname -m` == "armv7l" ]] && [[ $agent_flavor == "datadog-agent" ]] && [ ! "$no_agent" ]; then
+    ERROR_MESSAGE="The full $nice_flavor isn't available for your architecture (armv7l).\nInstall the $(getMapData flavor_to_readable datadog-iot-agent) by setting DD_AGENT_FLAVOR='datadog-iot-agent'."
     ERROR_CODE=$UNSUPPORTED_PLATFORM_CODE
     printf "\033[31m$ERROR_MESSAGE\033[0m\n"
     report_telemetry
     exit 1;
+fi
+
+if [ ${#apm_libraries[@]} -gt 0 ] && [ $agent_major_version = "6" ] ; then
+  ERROR_MESSAGE="APM library injection is not supported with Agent version 6"
+  ERROR_CODE=$INVALID_PARAMETERS_CODE
+  echo -e "\033[31m$ERROR_MESSAGE\033[0m\n"
+  report_telemetry
+  exit 1;
 fi
 
 # OS/Distro Detection
@@ -577,7 +728,6 @@ if [ "$OS" = "RedHat" ]; then
 
     $sudo_cmd sh -c "echo -e '[datadog]\nname = Datadog, Inc.\nbaseurl = https://${yum_url}/${yum_version_path}/${ARCHI}/\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=${rpm_repo_gpgcheck}\npriority=1\ngpgkey=${gpgkeys}' > /etc/yum.repos.d/datadog.repo"
 
-    printf "\033[34m* Installing the $nice_flavor package\n\033[0m\n"
     $sudo_cmd yum -y clean metadata
 
     dnf_flag=""
@@ -598,9 +748,18 @@ if [ "$OS" = "RedHat" ]; then
     fi
 
     declare -a packages
-    packages=("$agent_flavor")
+    if [ "$no_agent" ]; then
+      packages=()
+    else
+      packages=("$agent_flavor")
+    fi
+
     if [ -n "$fips_mode" ]; then
       packages+=("datadog-fips-proxy")
+    fi
+
+    if [ ${#apm_libraries[@]} -gt 0 ]; then
+      packages+=("${apm_libraries[@]}")
     fi
 
     echo -e "  \033[33mInstalling package(s): ${packages[*]}\n\033[0m"
@@ -610,19 +769,37 @@ if [ "$OS" = "RedHat" ]; then
 elif [ "$OS" = "Debian" ]; then
     apt_trusted_d_keyring="/etc/apt/trusted.gpg.d/datadog-archive-keyring.gpg"
     apt_usr_share_keyring="/usr/share/keyrings/datadog-archive-keyring.gpg"
+    
+    DD_APT_INSTALL_ERROR_MSG=/tmp/ddog_install_error_msg
+    MAX_RETRY_NB=10
+    for i in $(seq 1 $MAX_RETRY_NB)
+    do
+        printf "\033[34m\n* Installing apt-transport-https, curl and gnupg\n\033[0m\n"
+        $sudo_cmd apt-get update || printf "\033[31m'apt-get update' failed, the script will not install the latest version of apt-transport-https.\033[0m\n"
+        # installing curl might trigger install of additional version of libssl; this will fail the installation process,
+        # see https://unix.stackexchange.com/q/146283 for reference - we use DEBIAN_FRONTEND=noninteractive to fix that
+        apt_exit_code=0
+        if [ -z "$sudo_cmd" ]; then
+            # if $sudo_cmd is empty, doing `$sudo_cmd X=Y command` fails with
+            # `X=Y: command not found`; therefore we don't prefix the command with
+            # $sudo_cmd at all in this case
+            DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https curl gnupg 2>$DD_APT_INSTALL_ERROR_MSG  || apt_exit_code=$?
+        else
+            $sudo_cmd DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https curl gnupg 2>$DD_APT_INSTALL_ERROR_MSG || apt_exit_code=$?
+        fi
 
-    printf "\033[34m\n* Installing apt-transport-https, curl and gnupg\n\033[0m\n"
-    $sudo_cmd apt-get update || printf "\033[31m'apt-get update' failed, the script will not install the latest version of apt-transport-https.\033[0m\n"
-    # installing curl might trigger install of additional version of libssl; this will fail the installation process,
-    # see https://unix.stackexchange.com/q/146283 for reference - we use DEBIAN_FRONTEND=noninteractive to fix that
-    if [ -z "$sudo_cmd" ]; then
-        # if $sudo_cmd is empty, doing `$sudo_cmd X=Y command` fails with
-        # `X=Y: command not found`; therefore we don't prefix the command with
-        # $sudo_cmd at all in this case
-        DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https curl gnupg
-    else
-        $sudo_cmd DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https curl gnupg
-    fi
+        if grep "Could not get lock" $DD_APT_INSTALL_ERROR_MSG; then
+            RETRY_TIME=$((i*5))
+            printf "\033[31mInstallation failed: Unable to get lock.\nRetrying in ${RETRY_TIME}s ($i/$MAX_RETRY_NB).\033[0m\n"
+            sleep $RETRY_TIME
+        elif [ $apt_exit_code -ne 0 ]; then
+            cat $DD_APT_INSTALL_ERROR_MSG
+            exit $apt_exit_code
+        else
+            break
+        fi
+    done
+
     printf "\033[34m\n* Installing APT package sources for Datadog\n\033[0m\n"
     $sudo_cmd sh -c "echo 'deb [signed-by=${apt_usr_share_keyring}] https://${apt_url}/ ${apt_repo_version}' > /etc/apt/sources.list.d/datadog.list"
 
@@ -663,7 +840,6 @@ elif [ "$OS" = "Debian" ]; then
       fi
     fi
 
-    printf "\033[34m\n* Installing the $nice_flavor package\n\033[0m\n"
     ERROR_MESSAGE="ERROR
 Failed to update the sources after adding the Datadog repository.
 This may be due to any of the configured APT sources failing -
@@ -673,7 +849,7 @@ If the failing repository is Datadog, please contact Datadog support.
 "
     $sudo_cmd apt-get update -o Dir::Etc::sourcelist="sources.list.d/datadog.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
     ERROR_MESSAGE="ERROR
-Failed to install the $agent_flavor package, sometimes it may be
+Failed to install one or more packages, sometimes it may be
 due to another APT source failing. See the logs above to
 determine the cause.
 If the cause is unclear, please contact Datadog support.
@@ -688,9 +864,18 @@ If the cause is unclear, please contact Datadog support.
     fi
 
     declare -a packages
-    packages=("$agent_flavor" "datadog-signing-keys")
+    if [ "$no_agent" ]; then
+      packages=("datadog-signing-keys")
+    else
+      packages=("$agent_flavor" "datadog-signing-keys")
+    fi
+
     if [ -n "$fips_mode" ]; then
      packages+=("datadog-fips-proxy")
+    fi
+
+    if [ ${#apm_libraries[@]} -gt 0 ]; then
+      packages+=("${apm_libraries[@]}")
     fi
 
     echo -e "  \033[33mInstalling package(s): ${packages[*]}\n\033[0m"
@@ -776,8 +961,6 @@ elif [ "$OS" = "SUSE" ]; then
   echo -e "\033[34m\n* Refreshing repositories\n\033[0m"
   $sudo_cmd zypper --non-interactive --no-gpg-checks refresh datadog
 
-  echo -e "\033[34m\n* Installing the $nice_flavor package\n\033[0m"
-
   # ".32" is the latest version supported for OpenSUSE < 15 and SLES < 12
   # we explicitly test for SUSE11 = "yes", as some SUSE11 don't have /etc/os-release, thus SUSE_VER is empty
   if [ "$DISTRIBUTION" == "openSUSE" ] && { [ "$SUSE11" == "yes" ] || [ "$SUSE_VER" -lt 15 ]; }; then
@@ -823,11 +1006,23 @@ elif [ "$OS" = "SUSE" ]; then
   fi
 
   declare -a packages
-  packages=("$agent_flavor")
+  if [ "$no_agent" ]; then
+    packages=()
+  else
+    packages=("$agent_flavor")
+  fi
+
   if [ -n "$fips_mode" ]; then
     packages+=("datadog-fips-proxy")
   fi
 
+  if [ ${#apm_libraries[@]} -gt 0 ]; then
+    ERROR_MESSAGE="APM injection is not supported on SUSE"
+    ERROR_CODE=$UNSUPPORTED_PLATFORM_CODE
+    echo -e "\033[31m$ERROR_MESSAGE\033[0m\n"
+    report_telemetry
+    exit 1;
+  fi
 
   echo -e "  \033[33mInstalling package(s): ${packages[*]}\n\033[0m"
 
@@ -878,7 +1073,7 @@ fi
 # Set the configuration
 if [ -e "$config_file" ] && [ -z "$upgrade" ]; then
   printf "\033[34m\n* Keeping old $config_file configuration file\n\033[0m\n"
-else
+elif [ ! "$no_agent" ]; then
   if [ ! -e "$config_file" ]; then
     $sudo_cmd cp "$config_file.example" "$config_file"
   fi
@@ -923,42 +1118,50 @@ EOF
   if [ "$host_tags" ]; then
       printf "\033[34m\n* Adding your HOST TAGS to the $nice_flavor configuration: $config_file\n\033[0m\n"
       formatted_host_tags="['""$( echo "$host_tags" | sed "s/,/','/g" )""']"  # format `env:prod,foo:bar` to yaml-compliant `['env:prod','foo:bar']`
-      $sudo_cmd sh -c "sed -i \"s/# tags:.*/tags: ""$formatted_host_tags""/\" $config_file"
+      $sudo_cmd sh -c "sed -i \"s/^# tags:.*/tags: ""$formatted_host_tags""/\" $config_file"
+  fi
+
+  if [ "$DD_RUNTIME_SECURITY_CONFIG_ENABLED" == "true" ]; then
+    ensure_config_file_exists "$sudo_cmd" "$system_probe_config_file" "root"
+    ensure_config_file_exists "$sudo_cmd" "$security_agent_config_file" "root"
+
+    printf "\033[34m\n* Enabling runtime security in configuration\n\033[0m\n"
+    $sudo_cmd sh -c "sed -i 's/^#\s*runtime_security_config:/runtime_security_config:/' $security_agent_config_file $system_probe_config_file"
+    $sudo_cmd sh -c "sed -i '/^runtime_security_config:/,// s/\(\s\+\)#\s*enabled:\s*false/\1enabled: true/' $security_agent_config_file $system_probe_config_file"
+  fi
+
+  if [ "$DD_COMPLIANCE_CONFIG_ENABLED" == "true" ]; then
+    ensure_config_file_exists "$sudo_cmd" "$security_agent_config_file" "root"
+
+    printf "\033[34m\n* Enabling compliance monitoring in configuration\n\033[0m\n"
+    $sudo_cmd sh -c "sed -i 's/^#\s*compliance_config:/compliance_config:/' $security_agent_config_file"
+    $sudo_cmd sh -c "sed -i '/^compliance_config:/,// s/\(\s\+\)#\s*enabled:\s*false/\1enabled: true/' $security_agent_config_file"
   fi
 fi
 
-$sudo_cmd chown dd-agent:dd-agent "$config_file"
-$sudo_cmd chmod 640 "$config_file"
+if [ ! "$no_agent" ]; then
+  $sudo_cmd chown dd-agent:dd-agent "$config_file"
+  $sudo_cmd chmod 640 "$config_file"
+fi
 
 # set the FIPS configuration
 if [ -n "$fips_mode" ]; then
-  if [ -e "$config_file_fips" ] && [ -z "$upgrade" ]; then
-    printf "\033[34m\n* Keeping old $config_file_fips configuration file\n\033[0m\n"
-  else
-    if [ ! -e "$config_file_fips" ]; then
-      $sudo_cmd cp "$config_file_fips.example" "$config_file_fips"
-  
-      # TODO: set port range in file, or environment variable
-    fi
-
-    $sudo_cmd chown dd-agent:dd-agent "$config_file_fips"
-    $sudo_cmd chmod 640 "$config_file_fips"
-
-  fi
+  ensure_config_file_exists "$sudo_cmd" "$config_file_fips" "dd-agent"
+  # TODO: set port range in file, or environment variable
 fi
 
 # set the system-probe configuration
 if [ -n "$system_probe_ensure_config" ]; then
-  if [ -e "$system_probe_config_file" ] && [ -z "$upgrade" ]; then
-    printf "\033[34m\n* Keeping old $system_probe_config_file configuration file\n\033[0m\n"
-  else
-    if [ ! -e "$system_probe_config_file" ]; then
-      $sudo_cmd cp "$system_probe_config_file.example" "$system_probe_config_file"
-    fi
+  ensure_config_file_exists "$sudo_cmd" "$system_probe_config_file" "root"
+fi
 
-    $sudo_cmd chown root:dd-agent "$system_probe_config_file"
-    $sudo_cmd chmod 640 "$system_probe_config_file"
-  fi
+# run apm injection scripts
+if [ -n "$host_injection_enabled" ]; then
+  $sudo_cmd dd-host-install --no-agent-restart ${no_config_change}
+fi
+
+if [ -n "$docker_injection_enabled" ]; then
+  $sudo_cmd dd-container-install --no-agent-restart
 fi
 
 # Creating or overriding the install information
@@ -968,7 +1171,10 @@ install_method:
   tool_version: install_scriptINSTALL_INFO_VERSION_PLACEHOLDER
   installer_version: install_script-$install_script_version
 "
-$sudo_cmd sh -c "echo '$install_info_content' > $etcdir/install_info"
+
+if [ ! "$no_agent" ]; then
+  $sudo_cmd sh -c "echo '$install_info_content' > $etcdir/install_info"
+fi
 
 if [ -n "$fips_mode" ]; then
   # Creating or overriding the install information
@@ -981,7 +1187,8 @@ fi
 
 service_cmd="service"
 if [ "$SUSE11" == "yes" ]; then
-  service_cmd=`$sudo_cmd which service`
+  # We're testing SLES11 on a opensuse 13.2, `which service` will fail on openSUSE 13.2 and needs to have `service` as a default value
+  service_cmd=`$sudo_cmd which service || echo "service"`
 fi
 
 declare -a monitoring_services
@@ -992,7 +1199,7 @@ if [ $no_start ]; then
 fi
 
 for current_service in "${services[@]}"; do
-  nice_current_flavor=${flavor_to_readable[$current_service]}
+    nice_current_flavor=$(getMapData flavor_to_readable "$current_service")
 
   # Use /usr/sbin/service by default.
   # Some distros usually include compatibility scripts with Upstart or Systemd. Check with: `command -v service | xargs grep -E "(upstart|systemd)"`
